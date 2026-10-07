@@ -29,6 +29,7 @@ import type { McpContext, McpToolDefinition } from "@/lib/mcp/types";
 import { resolveActiveLeadForContact, type LeadCandidate } from "@/lib/leads/active-lead";
 import { podeChamarFerramenta, recusaParaOModelo } from "@/lib/leads/escopo-de-funil";
 import { escritaCabeNoTurno } from "./escopo-das-escritas";
+import { chaveDaEscritaDoNegocio, criarFilaDeEscritasDoNegocio } from "./escritas-do-negocio";
 
 export interface RuntimeHandoffSignal {
   triggered: boolean;
@@ -181,6 +182,7 @@ function shapeToZodObject(shape: Record<string, z.ZodTypeAny>): z.ZodTypeAny {
 function wrapMcpTool(
   def: McpToolDefinition,
   input: PickToolsInput,
+  executarEscrita: ReturnType<typeof criarFilaDeEscritasDoNegocio>,
 ): Tool {
   const inputSchema = shapeToZodObject(def.inputSchema as Record<string, z.ZodTypeAny>);
 
@@ -388,9 +390,15 @@ function wrapMcpTool(
         // aqui, no único ponto que tem `input`, para valer para todo chamador
         // de `pickToolsFromMcp` — quem não tem contato de turno (rota HTTP,
         // MCP externo, agente sem conversa) continua com o ctx de antes (#2158).
-        const result = await def.handler(
-          argsRecord as never,
-          input.contatoDoTurno ? { ...input.ctx, contatoDoTurno: input.contatoDoTurno } : input.ctx,
+        // Depois da tradução contato → negócio: ids diferentes podem mirar o mesmo card.
+        // Aguarda TODAS as escritas do handler, inclusive atividade que troca updated_at.
+        // A trava otimista nativa continua recusando interferência humana real.
+        const result = await executarEscrita(
+          chaveDaEscritaDoNegocio(input.ctx.organizationId, def, argsRecord),
+          () => def.handler(
+            argsRecord as never,
+            input.contatoDoTurno ? { ...input.ctx, contatoDoTurno: input.contatoDoTurno } : input.ctx,
+          ),
         );
 
         // Capture handoff signal so the runtime can short-circuit the loop.
@@ -491,6 +499,7 @@ function recusaDoHandler(result: unknown): string | null {
 
 export function pickToolsFromMcp(input: PickToolsInput): Record<string, Tool> {
   const result: Record<string, Tool> = {};
+  const executarEscrita = criarFilaDeEscritasDoNegocio();
 
   for (const id of input.toolIds) {
     const def = getToolByName(id);
@@ -529,7 +538,7 @@ export function pickToolsFromMcp(input: PickToolsInput): Record<string, Tool> {
     )
       continue;
 
-    result[def.name] = wrapMcpTool(def, input);
+    result[def.name] = wrapMcpTool(def, input, executarEscrita);
   }
 
   // Auto-inject handoff tool when enabled even if not in tool_ids — Spec 10
@@ -537,7 +546,7 @@ export function pickToolsFromMcp(input: PickToolsInput): Record<string, Tool> {
   if (input.handoffToolEnabled && !result[HANDOFF_TOOL_NAME]) {
     const handoff = allTools.find((t) => t.name === HANDOFF_TOOL_NAME);
     if (handoff) {
-      result[HANDOFF_TOOL_NAME] = wrapMcpTool(handoff, input);
+      result[HANDOFF_TOOL_NAME] = wrapMcpTool(handoff, input, executarEscrita);
     }
   }
 
@@ -549,7 +558,7 @@ export function pickToolsFromMcp(input: PickToolsInput): Record<string, Tool> {
       if (deCapacidadeDesligada(nome, input.capacidadesLigadas ?? []) || result[nome]) continue;
       const tool = allTools.find((t) => t.name === nome);
       if (tool) {
-        result[nome] = wrapMcpTool(tool, input);
+        result[nome] = wrapMcpTool(tool, input, executarEscrita);
       }
     }
   }
