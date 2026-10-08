@@ -1,0 +1,63 @@
+name: TACT - construir candidato recuperavel
+
+on:
+  push:
+    branches: [tact/correcoes-recuperaveis-20261008]
+  workflow_dispatch:
+
+# Somente o fork de Guilherme. Não publica release/imagem no projeto oficial.
+permissions:
+  contents: read
+
+jobs:
+  construir:
+    if: github.repository == 'ozzure/DeskcommCRM'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: app
+            dockerfile: Dockerfile
+          - service: worker
+            dockerfile: Dockerfile.worker
+          - service: scheduler
+            dockerfile: Dockerfile.scheduler
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - name: Construir a imagem exata, sem segredos
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: tact-candidate-${{ matrix.service }}:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/ozzure/DeskcommCRM
+          build-args: |
+            APP_VERSION=1.76.0-tact-${{ github.sha }}
+          cache-from: type=gha,scope=tact-${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=tact-${{ matrix.service }}
+      - name: Preservar artefato e checksum para a implantação
+        env:
+          SERVICE: ${{ matrix.service }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p artefatos
+          docker inspect "tact-candidate-${SERVICE}:${COMMIT}" > "artefatos/${SERVICE}.json"
+          docker save "tact-candidate-${SERVICE}:${COMMIT}" | gzip > "artefatos/${SERVICE}.tar.gz"
+          cd artefatos
+          sha256sum "${SERVICE}.tar.gz" > "${SERVICE}.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tact-candidate-${{ matrix.service }}-${{ github.sha }}
+          path: artefatos/
+          retention-days: 7
