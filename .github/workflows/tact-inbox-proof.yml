@@ -1,0 +1,178 @@
+name: TACT - prova de comando no Inbox
+
+on:
+  push:
+    branches: [ci/tact-inbox-proof-b950]
+
+permissions:
+  contents: read
+
+jobs:
+  inbox:
+    if: github.repository == 'ozzure/DeskcommCRM'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      E2E_PORT: '3001'
+      SENTRY_DSN: 'off'
+      NEXT_TELEMETRY_DISABLED: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: b9505480a4d3689a5839348da46794f4a5c8e74b
+          persist-credentials: false
+      - name: Conferir a árvore exata do candidato
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = b9505480a4d3689a5839348da46794f4a5c8e74b
+          git rev-parse HEAD > .ci-proof-source.txt
+          sha256sum supabase/baseline.sql tests/e2e/inbox-quem-manda.spec.ts >> .ci-proof-source.txt
+
+      - name: Tirar as portas do Supabase da faixa efêmera
+        if: runner.environment == 'github-hosted'
+        run: |
+          set -euo pipefail
+          portas=$(grep -oE '^[[:space:]]*(shadow_)?port[[:space:]]*=[[:space:]]*[0-9]+' supabase/config.toml \
+            | grep -oE '[0-9]+$' | sort -un | paste -sd, -)
+          if [ -z "$portas" ]; then
+            echo "::error::nenhuma porta lida de supabase/config.toml — a sonda perdeu o arquivo, e reservar nada é não reservar"
+            exit 1
+          fi
+          sudo sysctl -w net.ipv4.ip_local_reserved_ports="$portas"
+          echo "faixa efêmera: $(cat /proc/sys/net/ipv4/ip_local_port_range) | reservadas: $(cat /proc/sys/net/ipv4/ip_local_reserved_ports)"
+          abertas=$(ss -Htan | awk '{print $4}' | sed 's/.*://' | sort -u)
+          ocupadas=$(comm -12 <(printf '%s\n' "$abertas") <(tr , '\n' <<<"$portas" | sort -u))
+          if [ -n "$ocupadas" ]; then
+            echo "::warning::porta(s) do Supabase já em uso por conexão aberta antes da reserva: $(echo $ocupadas)"
+          fi
+
+      - uses: ./.github/actions/preparar-node
+        timeout-minutes: 5
+
+      - uses: supabase/setup-cli@v3
+        with:
+          version: 2.117.0
+
+      - name: Subir Supabase local (sem a cadeia de migrations)
+        run: |
+          set -euo pipefail
+          mv supabase/migrations /tmp/migrations-off
+          mkdir -p supabase/migrations
+          esperas=(0 20 60 120)
+          registros=(ghcr.io public.ecr.aws ghcr.io public.ecr.aws)
+          for tentativa in 1 2 3 4; do
+            espera=${esperas[$((tentativa - 1))]}
+            registro=${registros[$((tentativa - 1))]}
+            if [ "$espera" -gt 0 ]; then
+              echo "::warning title=supabase start: nova tentativa::tentativa ${tentativa} de 4 daqui a ${espera}s, puxando de ${registro} — a anterior falhou baixando imagem do registro"
+              supabase stop --no-backup || true
+              sleep "$espera"
+            fi
+            if SUPABASE_INTERNAL_IMAGE_REGISTRY="$registro" supabase start -x studio,postgres-meta 2>&1 | tee /tmp/supabase-start.log; then
+              exit 0
+            fi
+            if ! grep -qE 'toomanyrequests|failed to pull docker image|error pulling image|TLS handshake timeout|i/o timeout|connection reset by peer' /tmp/supabase-start.log; then
+              echo "::error title=supabase start falhou (não é o registro)::a saída acima não tem erro de pull nem de rede, então não há nova tentativa"
+              exit 1
+            fi
+          done
+          echo "::error title=supabase start falhou 4 vezes baixando imagens::ghcr.io e public.ecr.aws recusaram o pull nas 4 tentativas (esperas de 20s, 60s e 120s). É limite de taxa ou rede do registro, não o PR — rerode a parte."
+          exit 1
+
+      - name: Habilitar extensões exigidas pelo baseline
+        run: |
+          psql "postgresql://postgres:postgres@127.0.0.1:54322/postgres" -v ON_ERROR_STOP=1 -q <<'SQL'
+          create schema if not exists extensions;
+          create extension if not exists "uuid-ossp" with schema extensions;
+          create extension if not exists pgcrypto with schema extensions;
+          create extension if not exists vector with schema public;
+          create extension if not exists citext with schema public;
+          create extension if not exists pg_trgm with schema public;
+          SQL
+
+      - name: Aplicar o baseline.sql (o mesmo que o install.sh do kit aplica)
+        run: |
+          psql "postgresql://postgres:postgres@127.0.0.1:54322/postgres" \
+            -v ON_ERROR_STOP=1 -q -f supabase/baseline.sql
+
+      - name: Semear a chave de cifra dos segredos (o que o install.sh faz)
+        run: |
+          psql "postgresql://postgres:postgres@127.0.0.1:54322/postgres" -v ON_ERROR_STOP=1 -q \
+            -c "insert into private.app_secrets (name, value) values ('nuvemshop_oauth_key', '$(openssl rand -hex 32)') on conflict (name) do nothing;"
+
+      - name: Reiniciar o Realtime (a publication nasceu no passo anterior)
+        run: |
+          IDS=$(docker ps -q --filter name=supabase_realtime)
+          if [ -z "$IDS" ]; then
+            echo "::error::Nenhum container supabase_realtime — o stack não subiu como esperado."
+            exit 1
+          fi
+          docker restart $IDS
+          for i in $(seq 1 30); do
+            estado=$(docker inspect -f '{{.State.Health.Status}}' $IDS 2>/dev/null || echo desconhecido)
+            [ "$estado" = "healthy" ] && { echo "realtime saudável em ~$((i*2))s"; break; }
+            sleep 2
+          done
+          docker inspect -f '{{.State.Health.Status}}' $IDS
+
+      - name: Exportar credenciais do stack local
+        run: |
+          supabase status -o env > /tmp/sb.env
+          {
+            echo "NEXT_PUBLIC_SUPABASE_URL=$(grep '^API_URL=' /tmp/sb.env | cut -d'"' -f2)"
+            echo "NEXT_PUBLIC_SUPABASE_ANON_KEY=$(grep '^ANON_KEY=' /tmp/sb.env | cut -d'"' -f2)"
+            echo "SUPABASE_SERVICE_ROLE_KEY=$(grep '^SERVICE_ROLE_KEY=' /tmp/sb.env | cut -d'"' -f2)"
+          } >> "$GITHUB_ENV"
+
+      - name: Gerar o .env.e2e (ambiente da suíte)
+        run: pnpm e2e:env
+
+      - name: Publicar o .env.e2e no ambiente do job
+        run: grep -vE '^[[:space:]]*(#|$)' .env.e2e >> "$GITHUB_ENV"
+
+      - name: Build de produção (com o ambiente do E2E)
+        run: pnpm e2e:build
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+          SENTRY_DSN: "off"
+
+      - name: Instalar o browser
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Semear credenciais fictícias nativas
+        run: |
+          cp .env.e2e .env.local
+          pnpm exec tsx scripts/seed-e2e-credentials.ts
+      - name: Inbox - Assumir, devolver e Fila pela tela
+        env:
+          PLAYWRIGHT_JSON_OUTPUT_FILE: test-results/inbox-results.json
+        run: |
+          set -euo pipefail
+          mkdir -p test-results
+          pnpm exec playwright test tests/e2e/inbox-quem-manda.spec.ts --reporter=list,json
+      - name: Registrar o resultado e a origem
+        if: always()
+        run: |
+          {
+            echo '## Prova de tela e PostgREST do candidato TACT'
+            echo 'Fonte fixa: b9505480a4d3689a5839348da46794f4a5c8e74b'
+            echo 'Somente Supabase local, Chromium e dados fictícios; sem modelo ou WhatsApp.'
+            if [ -f test-results/inbox-results.json ]; then
+              jq '.stats' test-results/inbox-results.json
+            else
+              echo 'Sem resultado do Playwright: o preparo não chegou à execução da prova.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: tact-inbox-b950-prova
+          path: |
+            .ci-proof-source.txt
+            evidence/inbox-quem-manda/
+            test-results/
+          include-hidden-files: true
+          retention-days: 7
+      - name: Encerrar o stack descartável
+        if: always()
+        run: supabase stop --no-backup
